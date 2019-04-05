@@ -1,0 +1,134 @@
+*Before saying anything, I wrote a very long comments on https://github.com/Thinkei/heropay-service/pull/512 and it just gone due to github error*
+
+# Issue
+We were facing a strange case where pagination does not work as expected, that is, when we use
+```ruby
+relation.page(1).per(20).total_pages
+=> 2
+relation.page(1).per(20).total_count
+=> 22
+relation.page(1).per(20).size
+=> 20
+a = relation.page(1).per(20)
+a.total_pages
+=> 1
+a.total_count
+=> 15
+a.size
+=> 15
+```
+
+# Root cause - pt1 - why Kaminari not works
+*Again, before saying anything, I spent lots of hours investigating it and now I will just jump right into the root cause to not taking anyone else's time...*
+
+The cause of changing total_pages from 2 to 1 and total_count from 22 to 15 was because size is now 15.
+And the calculation within Kaminari say `well, @records.length is 15, 15 is smaller than 20, and current page is 1, so.... total_count must be 15, thus total_count must be 15 only` (ref: **kaminari-activerecord@/lib/kaminari/activerecord/active_record_relation_methods.rb:25**)
+
+So, the question is, where is the @records comes, and how could it be 15 instead of 20 while we already know there is 22 records match the query
+
+First, @records is the instance_variable of an ActiveRecord::Relation that stores the records within the Relation - the rows those matched the query
+
+Second, why 15? Because, magically, if you run the query directly using `ActiveRecord::Base.connection.execute` we will get...
+
+```ruby
+def query_relation
+  HeropayTransaction.
+    joins(:member_info).
+    includes(:member_info, :eh_bank_account).
+    not_deleted.
+    where(
+      status: ['pending', 'payment_processed', 'complete', 'error'],
+      referred_from: ['client']
+    ).
+    where(
+      Transactions::SearchQueryBuidler.new("kevin").build_query
+    ).
+    order(created_at: :desc)
+end
+
+// ntuples returns number of rows matched the query
+ActiveRecord::Base.connection.execute(query_relation.to_sql).ntuples
+=> 29
+```
+
+But why 29 when we know there is only 22? well, after investigating, I found out, with per page 20 we'll have 2 page, and
+29 = 20 + 9 = (15 + 5) + (7 + 2) = (15 *valid active_record object* + 5 **invalid** *ones*) + (7 *valid ones* + 2 **invalid** *ones*) = 22 *valids ones* + 7 **invalid** *ones* = 22
+
+# Root cause - pt2 - why there are invalid records
+What have I just written?
+
+After looking through the results from the direct query, I only know within the first page from the direct query, there are 5 records those which have the same heropay_transation_id and member_info_id and only different on bank_account_id
+
+![image](https://user-images.githubusercontent.com/26796108/55599183-c12ea200-5780-11e9-95d9-3612fa06102f.png)
+
+And the same happen to the second page, 2 records duplicated
+
+But all duplicated is being filtered out after ActiveRecord evaluated the result so that no one can see them if using the Relation. So I think it must from some **1-n association** that lay within DB that somehow being rejected by ActiveRecord , and from the result, it must the **1 member_info - n bank_accounts**
+
+And I found it out eventually, it was from a innocent yet dangerous LOC
+```ruby
+// heropay-service/app/models/heropay_transaction.rb:26
+has_one :eh_bank_account, -> { where(source: :eh) }, through: :member_info, source: :bank_accounts
+```
+
+What we have here is an has_one_through association
+And after check, I found out it uses `LIMIT 1` to select the chosen `bank_account` for `member_info`
+
+But that `LIMIT 1` is not in the scope of association itself, but was generated due to the `has_one`
+and that's where things go wrong, because we don't have that `LIMIT 1` on the generated query from `query_relation` because there is nothing tell it to do so
+
+Here the generated query ***censored version - filtered out redundant select fields***
+```ruby
+"
+  SELECT 
+    \"heropay_transactions\".\"id\" AS t0_r0,
+    \"member_infos\".\"id\" AS t1_r0,
+    \"bank_accounts\".\"id\" AS t2_r0
+  FROM
+    \"heropay_transactions\"
+    INNER JOIN \"heropay_balances\" ON \"heropay_balances\".\"id\" = \"heropay_transactions\".\"heropay_balance_id\"
+    INNER JOIN \"member_infos\" ON \"member_infos\".\"heropay_balance_id\" = \"heropay_balances\".\"id\"
+    
+    LEFT OUTER JOIN \"heropay_balances\" \"heropay_balances_heropay_transactions_join_2\" ON \"heropay_balances_heropay_transactions_join_2\".\"id\" = \"heropay_transactions\".\"heropay_balance_id\"
+    
+    LEFT OUTER JOIN \"member_infos\" \"member_infos_heropay_transactions_join\" ON \"member_infos_heropay_transactions_join\".\"heropay_balance_id\" = \"heropay_balances_heropay_transactions_join_2\".\"id\"
+    
+    #{
+      # NO "LIMIT 1" ON THE UNDER LINE - BECAUSE NO ONE TELLS IT TO DO THAT
+      # => SOME RECORDS WILL BE DUPLICATED
+      # => BE REJECTED BY ACTIVE_RECORD WHEN EVALUATING DUE TO HAS_ONE ASSOCIATION
+    }
+    LEFT OUTER JOIN \"bank_accounts\" ON \"bank_accounts\".\"member_info_id\" = \"member_infos_heropay_transactions_join\".\"id\" AND \"bank_accounts\".\"source\" = 0
+
+  WHERE
+    \"heropay_transactions\".\"deleted_at\" IS NULL
+    AND \"heropay_transactions\".\"status\" IN (0, 1, 2, 3)
+    AND \"heropay_transactions\".\"referred_from\" = 0
+    AND (
+      (\"heropay_transactions\".\"aba_lodgement_reference\" ILIKE '%kevin%'
+        OR \"heropay_transactions\".\"aba_description\" ILIKE '%kevin%'
+      )
+      OR (
+        (
+          (
+            (\"member_infos\".\"first_name\" ILIKE '%kevin%'
+              OR \"member_infos\".\"last_name\" ILIKE '%kevin%'
+            )
+            OR \"member_infos\".\"account_email\" ILIKE '%kevin%'
+          )
+          OR \"member_infos\".\"external_id\" ILIKE '%kevin%'
+        )
+        OR \"member_infos\".\"member_id\" ILIKE '%kevin%'
+      )
+    )
+  ORDER BY \"heropay_transactions\".\"created_at\" DESC\n"
+```
+
+# Conclusion
+There is nothing wrong within the `Kaminari` gems.
+We should update the association of `eh_bank_account` on `HeropayTransaction`
+
+# Suggestion
+Since I can not test with HeropayService locally DB due to missing DB data and insufficient knowledge on the service itself, I could only say we should
+1. either to have a specific association query to choose the `eh_bank_account` from `bank_accounts`
+2. or add constraint and correct data ensure that `member_info.bank_account.where(source: :eh)...` returns only 1 record
